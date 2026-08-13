@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Arcane Reelax 低於 50 杆自動補滿
 // @namespace    https://reelax.cn/
-// @version      1.2.0
+// @version      1.3.0
 // @description  使用官方瀏覽器腳本 API，在登入且釣魚批次剩餘少於 50 杆時自動補滿。
 // @author       FishSnack
 // @match        https://reelax.cn/*
@@ -22,6 +22,30 @@
   const LOG_PREFIX = '[Arcane Reelax 自動補滿]';
 
   let refillPending = false;
+  let statusBadge = null;
+
+  function setStatus(message, state = 'active') {
+    if (!statusBadge) {
+      statusBadge = document.createElement('div');
+      statusBadge.id = 'arcane-reelax-auto-refill-status';
+      Object.assign(statusBadge.style, {
+        position: 'fixed',
+        right: '12px',
+        bottom: '12px',
+        zIndex: '2147483647',
+        padding: '6px 10px',
+        borderRadius: '8px',
+        color: '#fff',
+        font: '12px/1.4 system-ui, sans-serif',
+        boxShadow: '0 2px 8px #0006',
+        pointerEvents: 'none',
+        opacity: '0.88',
+      });
+      document.documentElement.append(statusBadge);
+    }
+    statusBadge.style.background = state === 'error' ? '#b42318' : '#176b73';
+    statusBadge.textContent = `自動補滿 v1.3.0｜${message}`;
+  }
   async function getGameApi() {
     if (window.arcaneReelax) {
       await window.arcaneReelax.ready;
@@ -70,21 +94,33 @@
     if (refillPending) return;
 
     const snapshot = game.getSnapshot();
-    if (!snapshot) return; // 未登入或遊戲狀態尚未就緒
+    if (!snapshot) {
+      setStatus('等待登入／遊戲狀態');
+      return;
+    }
 
     const fishing = snapshot.fishing;
-    if (!isEligible(fishing)) return;
+    if (!isEligible(fishing)) {
+      const remaining = Number.isFinite(fishing?.remainingCasts)
+        ? `${fishing.remainingCasts} 杆`
+        : '等待釣魚批次';
+      setStatus(remaining);
+      return;
+    }
 
     refillPending = true;
+    setStatus(`剩餘 ${fishing.remainingCasts} 杆，補滿中`);
     try {
       const didRefill = await game.fishing.refill();
       if (didRefill) {
+        setStatus(`已補滿至 ${fishing.totalCasts} 杆`);
         console.info(
           LOG_PREFIX,
           `剩餘 ${fishing.remainingCasts} 杆，已透過官方 API 補滿至 ${fishing.totalCasts} 杆。`,
         );
       }
     } catch (error) {
+      setStatus(error?.message ?? '補滿失敗', 'error');
       console.warn(LOG_PREFIX, error?.code ?? 'REFILL_FAILED', error?.message ?? error);
     } finally {
       refillPending = false;
@@ -92,6 +128,7 @@
   }
 
   async function start() {
+    setStatus('等待官方 API');
     const game = await getGameApi();
 
     if (game.apiVersion !== 1) {
