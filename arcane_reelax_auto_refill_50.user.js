@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Arcane Reelax 低於 50 杆自動補滿
 // @namespace    https://reelax.cn/
-// @version      1.1.0
+// @version      1.2.0
 // @description  使用官方瀏覽器腳本 API，在登入且釣魚批次剩餘少於 50 杆時自動補滿。
 // @author       FishSnack
 // @match        https://reelax.cn/*
@@ -17,7 +17,8 @@
 
   const REFILL_BELOW = 50;
   const MIN_CHECK_DELAY_MS = 60_000;
-  const IDLE_CHECK_DELAY_MS = 5 * 60_000;
+  const MAX_CHECK_DELAY_MS = 2 * 60_000;
+  const UNKNOWN_CHECK_DELAY_MS = 60_000;
   const LOG_PREFIX = '[Arcane Reelax 自動補滿]';
 
   let refillPending = false;
@@ -48,17 +49,20 @@
 
   function getNextCheckDelay(game) {
     const fishing = game.getSnapshot()?.fishing;
-    if (!fishing || fishing.status !== 'running') return IDLE_CHECK_DELAY_MS;
-    if (!Number.isFinite(fishing.remainingCasts)) return IDLE_CHECK_DELAY_MS;
+    if (!fishing || fishing.status !== 'running') return UNKNOWN_CHECK_DELAY_MS;
+    if (!Number.isFinite(fishing.remainingCasts)) return UNKNOWN_CHECK_DELAY_MS;
     if (!Number.isFinite(fishing.cycleDurationMs) || fishing.cycleDurationMs <= 0) {
-      return IDLE_CHECK_DELAY_MS;
+      return UNKNOWN_CHECK_DELAY_MS;
     }
 
     // 直接睡到預估剩餘 49 杆的時間附近，不做高頻輪詢。
     const castsUntilThreshold = Math.max(0, fishing.remainingCasts - (REFILL_BELOW - 1));
-    return Math.max(
-      MIN_CHECK_DELAY_MS,
-      castsUntilThreshold * fishing.cycleDurationMs + 2_000,
+    return Math.min(
+      MAX_CHECK_DELAY_MS,
+      Math.max(
+        MIN_CHECK_DELAY_MS,
+        castsUntilThreshold * fishing.cycleDurationMs + 2_000,
+      ),
     );
   }
 
@@ -94,20 +98,28 @@
       console.warn(LOG_PREFIX, `未測試的腳本 API 版本：${game.apiVersion}`);
     }
 
+    let timerId = null;
     const scheduleNextCheck = () => {
+      if (timerId !== null) window.clearTimeout(timerId);
       const delay = getNextCheckDelay(game);
-      window.setTimeout(async () => {
+      timerId = window.setTimeout(async () => {
+        timerId = null;
         await checkAndRefill(game);
         scheduleNextCheck();
       }, delay);
     };
+
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState !== 'visible') return;
+      void checkAndRefill(game).finally(scheduleNextCheck);
+    });
 
     await checkAndRefill(game);
     scheduleNextCheck();
 
     console.info(
       LOG_PREFIX,
-      `已啟動；依單杆週期安排檢查，剩餘少於 ${REFILL_BELOW} 杆時補滿。`,
+      `已啟動；依單杆週期安排檢查（最長 2 分鐘校正），剩餘少於 ${REFILL_BELOW} 杆時補滿。`,
     );
   }
 
