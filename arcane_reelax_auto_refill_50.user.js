@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Arcane Reelax 航線助手＋低於 50 杆自動補滿
 // @namespace    https://reelax.cn/
-// @version      2.0.2
+// @version      2.1.0
 // @description  使用官方瀏覽器腳本 API，自動處理比賽、金風、經驗航線、場景魚餌、簽到及低於 50 杆補滿。
 // @author       FishSnack
 // @match        https://reelax.cn/*
@@ -15,10 +15,10 @@
 (() => {
   'use strict';
 
-  const VERSION = '2.0.2';
+  const VERSION = '2.1.0';
   const REFILL_BELOW = 50;
   const EVALUATE_INTERVAL_MS = 60_000;
-  const BOUNDARY_JITTER_MS = 10_000;
+  const ROUTE_RETRY_INTERVAL_MS = 5_000;
   const STORAGE_KEY = 'arcane-reelax-route-helper-v2';
   const LOG_PREFIX = '[Arcane Reelax 航線助手]';
   const PRIORITY_LABELS = { competition: '比賽', golden: '金風', experience: '經驗' };
@@ -50,6 +50,7 @@
   let game = null;
   let busy = false;
   let timerId = null;
+  let routeRetryTimerId = null;
   let panel = null;
   let statusNode = null;
   let detailNode = null;
@@ -158,6 +159,16 @@
     return kind.includes('guild') ? 'guildCompetition' : 'personalCompetition';
   }
 
+  function currentScene(snapshot) {
+    const current = snapshot.biomes.find((biome) => biome.isCurrent);
+    if (!current) return 'normal';
+    const competitions = current.activeCompetitions || [];
+    if (competitions.some((competition) => competitionKind(competition) === 'personalCompetition')) return 'personalCompetition';
+    if (competitions.some((competition) => competitionKind(competition) === 'guildCompetition')) return 'guildCompetition';
+    if (isGolden(current)) return 'golden';
+    return isArcaneSurge(current) ? 'arcaneSurge' : 'normal';
+  }
+
   function isGolden(biome) {
     const text = `${biome.weather?.id || ''} ${biome.weather?.name || ''} ${biome.weather?.description || ''}`.toLowerCase();
     return text.includes('金风') || text.includes('金風') || text.includes('golden');
@@ -216,11 +227,17 @@
     const isCaptain = role === 'captain' || role === 'leader';
     const useParty = party?.isInParty && party.canChangeBoatBiome &&
       ((isCaptain && settings.leaderPartyTravel) || (role === 'helmsman' && settings.helmsmanPartyTravel));
-    if (party?.isInParty && !isCaptain && role !== 'helmsman') return false;
+    if (party?.isInParty && !useParty) return false;
     setStatus(`前往 ${route.target.name}`, route.reason);
-    if (useParty) await game.party.travelTo(route.target.id);
-    else await game.biomes.travelTo(route.target.id);
-    return true;
+    try {
+      if (useParty) await game.party.travelTo(route.target.id);
+      else await game.biomes.travelTo(route.target.id);
+      clearRouteRetry();
+      return true;
+    } catch (error) {
+      scheduleRouteRetry();
+      throw error;
+    }
   }
 
   async function selectSceneBait(scene, snapshot) {
@@ -251,7 +268,7 @@
       if (route) {
         const moved = await travel(route, snapshot);
         const latest = game.getSnapshot() || snapshot;
-        await selectSceneBait(route.scene, latest);
+        await selectSceneBait(currentScene(latest), latest);
         setStatus(moved ? `已前往 ${route.target.name}` : `目前 ${route.target.name}`, route.reason);
       }
       if (checkInDue(game.getSnapshot() || snapshot) && await game.dailyCheckIn.claim()) {
@@ -272,13 +289,27 @@
     timerId = setTimeout(async () => { timerId = null; await evaluate(); scheduleEvaluation(); }, delay);
   }
 
+  function clearRouteRetry() {
+    if (routeRetryTimerId === null) return;
+    clearTimeout(routeRetryTimerId);
+    routeRetryTimerId = null;
+  }
+
+  function scheduleRouteRetry() {
+    if (routeRetryTimerId !== null) return;
+    routeRetryTimerId = setTimeout(() => {
+      routeRetryTimerId = null;
+      scheduleEvaluation(0);
+    }, ROUTE_RETRY_INTERVAL_MS);
+  }
+
   async function start() {
     createPanel();
     setStatus('等待官方 API');
     game = await getGameApi();
     renderPanel();
     for (const event of ['weather:changed', 'guild-boost:started', 'guild-boost:ended', 'competition:started']) {
-      game.on(event, () => scheduleEvaluation(Math.floor(Math.random() * BOUNDARY_JITTER_MS)));
+      game.on(event, () => scheduleEvaluation(0));
     }
     document.addEventListener('visibilitychange', () => {
       if (document.visibilityState === 'visible') scheduleEvaluation(0);
