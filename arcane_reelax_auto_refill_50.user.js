@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Arcane Reelax 航線助手＋低於 50 杆自動補滿
 // @namespace    https://reelax.cn/
-// @version      2.0.0
+// @version      2.0.1
 // @description  使用官方瀏覽器腳本 API，自動處理比賽、金風、經驗航線、場景魚餌、簽到及低於 50 杆補滿。
 // @author       FishSnack
 // @match        https://reelax.cn/*
@@ -15,7 +15,7 @@
 (() => {
   'use strict';
 
-  const VERSION = '2.0.0';
+  const VERSION = '2.0.1';
   const REFILL_BELOW = 50;
   const EVALUATE_INTERVAL_MS = 60_000;
   const BOUNDARY_JITTER_MS = 10_000;
@@ -232,15 +232,7 @@
   }
 
   function checkInDue(snapshot) {
-    const checkIn = snapshot.dailyCheckIn;
-    if (!settings.autoCheckIn || !checkIn?.canClaim) return false;
-    const key = `${STORAGE_KEY}:checkin:${checkIn.chinaDate}`;
-    let due = Number(localStorage.getItem(key));
-    if (!Number.isFinite(due) || due <= 0) {
-      due = Date.now() + Math.floor(Math.random() * 30 * 60_000);
-      localStorage.setItem(key, String(due));
-    }
-    return Date.now() >= due;
+    return Boolean(settings.autoCheckIn && snapshot.dailyCheckIn?.canClaim);
   }
 
   async function evaluate() {
