@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Arcane Reelax 航線助手＋低於 50 杆自動補滿
 // @namespace    https://reelax.cn/
-// @version      2.1.1
+// @version      2.1.2
 // @description  使用官方瀏覽器腳本 API，自動處理比賽、金風、經驗航線、場景魚餌、簽到及低於 50 杆補滿。
 // @author       FishSnack
 // @match        https://reelax.cn/*
@@ -15,7 +15,7 @@
 (() => {
   'use strict';
 
-  const VERSION = '2.1.1';
+  const VERSION = '2.1.2';
   const REFILL_BELOW = 50;
   const EVALUATE_INTERVAL_MS = 60_000;
   const ROUTE_RETRY_INTERVAL_MS = 5_000;
@@ -162,6 +162,27 @@
     }
     const text = `${levelExperience.current.toLocaleString('zh-TW')} / ${levelExperience.required.toLocaleString('zh-TW')}`;
     if (experienceNode.textContent !== text) experienceNode.textContent = text;
+  }
+
+  function syncLevelExperienceFromPage() {
+    const progressNode = document.querySelector('.player-progress');
+    if (!progressNode) return;
+    const fiberKey = Object.keys(progressNode).find((key) => key.startsWith('__reactFiber$'));
+    let fiber = fiberKey ? progressNode[fiberKey] : null;
+    for (let depth = 0; fiber && depth < 30; depth += 1, fiber = fiber.return) {
+      const candidates = [fiber.memoizedProps, fiber.pendingProps];
+      for (const props of candidates) {
+        const player = props?.session?.player;
+        const current = Number(player?.experience);
+        const required = Number(player?.experienceToNextLevel);
+        if (!Number.isSafeInteger(current) || !Number.isSafeInteger(required) || required <= 0) continue;
+        if (!levelExperience || levelExperience.current !== current || levelExperience.required !== required) {
+          levelExperience = { current, required };
+          renderLevelExperience();
+        }
+        return;
+      }
+    }
   }
 
   async function loadLevelExperience() {
@@ -343,6 +364,8 @@
     const levelObserver = new MutationObserver(renderLevelExperience);
     levelObserver.observe(document.documentElement, { childList: true, subtree: true });
     void loadLevelExperience();
+    syncLevelExperienceFromPage();
+    setInterval(syncLevelExperienceFromPage, 1_000);
     setStatus('等待官方 API');
     game = await getGameApi();
     renderPanel();
