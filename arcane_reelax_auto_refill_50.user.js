@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Arcane Reelax 航線助手＋低於 50 杆自動補滿
 // @namespace    https://reelax.cn/
-// @version      2.1.0
+// @version      2.1.1
 // @description  使用官方瀏覽器腳本 API，自動處理比賽、金風、經驗航線、場景魚餌、簽到及低於 50 杆補滿。
 // @author       FishSnack
 // @match        https://reelax.cn/*
@@ -15,7 +15,7 @@
 (() => {
   'use strict';
 
-  const VERSION = '2.1.0';
+  const VERSION = '2.1.1';
   const REFILL_BELOW = 50;
   const EVALUATE_INTERVAL_MS = 60_000;
   const ROUTE_RETRY_INTERVAL_MS = 5_000;
@@ -54,6 +54,7 @@
   let panel = null;
   let statusNode = null;
   let detailNode = null;
+  let levelExperience = null;
 
   function loadSettings() {
     try {
@@ -94,6 +95,7 @@
         .arrh-row{display:flex;align-items:center;gap:6px;margin:6px 0}.arrh-row label{flex:1}.arrh-row select{max-width:155px;color:#eefafa;background:#164c54;border:1px solid #548f97;border-radius:5px;padding:3px}
         .arrh-priority{display:grid;grid-template-columns:1fr auto auto;gap:5px;margin:4px 0}.arrh-note{font-size:11px;color:#f2cf88;margin-top:8px}
         #arcane-reelax-route-helper[data-collapsed="true"] #arrh-body{display:none}
+        .arrh-level-experience{margin-left:18px;color:#a9bec7;font-size:11px;font-weight:500;white-space:nowrap}
       </style>
       <header id="arrh-head"><b>航線助手 v${VERSION}</b><button id="arrh-toggle">收合</button></header>
       <div id="arrh-body"><div id="arrh-status">初始化</div><div id="arrh-detail"></div><div id="arrh-controls"></div></div>`;
@@ -146,6 +148,39 @@
 
   function escapeHtml(value) {
     return String(value).replace(/[&<>"']/g, (char) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[char]);
+  }
+
+  function renderLevelExperience() {
+    if (!levelExperience) return;
+    const levelNode = document.querySelector('.player-progress-heading .player-name-level');
+    if (!levelNode) return;
+    let experienceNode = levelNode.parentElement?.querySelector('.arrh-level-experience');
+    if (!experienceNode) {
+      experienceNode = document.createElement('span');
+      experienceNode.className = 'arrh-level-experience';
+      levelNode.insertAdjacentElement('afterend', experienceNode);
+    }
+    const text = `${levelExperience.current.toLocaleString('zh-TW')} / ${levelExperience.required.toLocaleString('zh-TW')}`;
+    if (experienceNode.textContent !== text) experienceNode.textContent = text;
+  }
+
+  async function loadLevelExperience() {
+    try {
+      const response = await fetch('/api/me', {
+        credentials: 'include',
+        headers: { Accept: 'application/json' },
+      });
+      if (!response.ok) return;
+      const data = await response.json();
+      const player = data?.player || data;
+      const current = Number(player?.experience);
+      const required = Number(player?.experienceToNextLevel);
+      if (!Number.isSafeInteger(current) || !Number.isSafeInteger(required) || required <= 0) return;
+      levelExperience = { current, required };
+      renderLevelExperience();
+    } catch (error) {
+      console.debug(LOG_PREFIX, '讀取等級經驗失敗', error);
+    }
   }
 
   async function getGameApi() {
@@ -305,6 +340,9 @@
 
   async function start() {
     createPanel();
+    const levelObserver = new MutationObserver(renderLevelExperience);
+    levelObserver.observe(document.documentElement, { childList: true, subtree: true });
+    void loadLevelExperience();
     setStatus('等待官方 API');
     game = await getGameApi();
     renderPanel();
