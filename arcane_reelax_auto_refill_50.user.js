@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Arcane Reelax 航線助手＋低於 50 杆自動補滿
 // @namespace    https://reelax.cn/
-// @version      2.0.1
+// @version      2.0.2
 // @description  使用官方瀏覽器腳本 API，自動處理比賽、金風、經驗航線、場景魚餌、簽到及低於 50 杆補滿。
 // @author       FishSnack
 // @match        https://reelax.cn/*
@@ -15,7 +15,7 @@
 (() => {
   'use strict';
 
-  const VERSION = '2.0.1';
+  const VERSION = '2.0.2';
   const REFILL_BELOW = 50;
   const EVALUATE_INTERVAL_MS = 60_000;
   const BOUNDARY_JITTER_MS = 10_000;
@@ -213,9 +213,10 @@
     if (!settings.autoTravel || route.target.isCurrent) return false;
     const party = snapshot.party;
     const role = String(party?.role || '').toLowerCase();
+    const isCaptain = role === 'captain' || role === 'leader';
     const useParty = party?.isInParty && party.canChangeBoatBiome &&
-      ((role === 'leader' && settings.leaderPartyTravel) || (role === 'helmsman' && settings.helmsmanPartyTravel));
-    if (party?.isInParty && role !== 'leader' && role !== 'helmsman') return false;
+      ((isCaptain && settings.leaderPartyTravel) || (role === 'helmsman' && settings.helmsmanPartyTravel));
+    if (party?.isInParty && !isCaptain && role !== 'helmsman') return false;
     setStatus(`前往 ${route.target.name}`, route.reason);
     if (useParty) await game.party.travelTo(route.target.id);
     else await game.biomes.travelTo(route.target.id);
