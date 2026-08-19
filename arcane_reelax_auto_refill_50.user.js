@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Arcane Reelax 航線助手＋低於 50 杆自動補滿
 // @namespace    https://reelax.cn/
-// @version      2.1.2
+// @version      2.1.3
 // @description  使用官方瀏覽器腳本 API，自動處理比賽、金風、經驗航線、場景魚餌、簽到及低於 50 杆補滿。
 // @author       FishSnack
 // @match        https://reelax.cn/*
@@ -15,7 +15,7 @@
 (() => {
   'use strict';
 
-  const VERSION = '2.1.2';
+  const VERSION = '2.1.3';
   const REFILL_BELOW = 50;
   const EVALUATE_INTERVAL_MS = 60_000;
   const ROUTE_RETRY_INTERVAL_MS = 5_000;
@@ -235,11 +235,10 @@
     return text.includes('奥秘涌流') || text.includes('奧秘湧流') || text.includes('arcane_surge');
   }
 
-  function experienceScore(biome, excludeMastery) {
-    const mastery = excludeMastery ? 0 : (biome.masteryExperienceBonusBasisPoints || 0);
+  function experienceScore(biome) {
     const weather = biome.weather?.experienceBonusBasisPoints || 0;
     const guild = biome.guildBoost?.isActive ? (biome.guildBoost.experienceBonusBasisPoints || 0) : 0;
-    return (1 + mastery / 10000) * (1 + weather / 10000) * (1 + guild / 10000);
+    return (1 + weather / 10000) * (1 + guild / 10000);
   }
 
   function highestLevelStable(biomes, currentId) {
@@ -252,8 +251,6 @@
   function chooseRoute(snapshot) {
     const unlocked = snapshot.biomes.filter((biome) => biome.isUnlocked);
     const current = unlocked.find((biome) => biome.isCurrent);
-    const party = snapshot.party;
-    const partyController = party?.isInParty && party.canChangeBoatBiome;
     for (const priority of settings.priorities) {
       if (priority === 'competition') {
         const candidates = unlocked.filter((biome) => (biome.activeCompetitions || []).length > 0);
@@ -266,7 +263,7 @@
       }
       if (priority === 'experience' && unlocked.length) {
         const target = [...unlocked].sort((a, b) =>
-          experienceScore(b, partyController) - experienceScore(a, partyController) ||
+          experienceScore(b) - experienceScore(a) ||
           Number(b.id === current?.id) - Number(a.id === current?.id) ||
           (b.requiredLevel || 0) - (a.requiredLevel || 0) || String(a.id).localeCompare(String(b.id)),
         )[0];
