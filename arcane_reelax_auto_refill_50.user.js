@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Arcane Reelax 航線助手＋低於 50 杆自動補滿
 // @namespace    https://reelax.cn/
-// @version      2.1.3
+// @version      2.1.4
 // @description  使用官方瀏覽器腳本 API，自動處理比賽、金風、經驗航線、場景魚餌、簽到及低於 50 杆補滿。
 // @author       FishSnack
 // @match        https://reelax.cn/*
@@ -15,9 +15,10 @@
 (() => {
   'use strict';
 
-  const VERSION = '2.1.3';
+  const VERSION = '2.1.4';
   const REFILL_BELOW = 50;
   const EVALUATE_INTERVAL_MS = 60_000;
+  const CHECK_IN_INTERVAL_MS = 1_000;
   const ROUTE_RETRY_INTERVAL_MS = 5_000;
   const STORAGE_KEY = 'arcane-reelax-route-helper-v2';
   const LOG_PREFIX = '[Arcane Reelax 航線助手]';
@@ -49,6 +50,7 @@
   let settings = loadSettings();
   let game = null;
   let busy = false;
+  let checkInBusy = false;
   let timerId = null;
   let routeRetryTimerId = null;
   let panel = null;
@@ -306,12 +308,30 @@
     return Boolean(settings.autoCheckIn && snapshot.dailyCheckIn?.canClaim);
   }
 
+  async function claimDailyCheckIn(snapshot = game?.getSnapshot()) {
+    if (checkInBusy || !settings.enabled || !game || !snapshot || !checkInDue(snapshot)) return false;
+    checkInBusy = true;
+    try {
+      if (!await game.dailyCheckIn.claim()) return false;
+      game.ui.dismissReminder('daily-check-in');
+      setStatus('今日簽到完成');
+      return true;
+    } catch (error) {
+      setStatus(error?.message || '簽到失敗', error?.code || 'ERROR');
+      console.warn(LOG_PREFIX, error);
+      return false;
+    } finally {
+      checkInBusy = false;
+    }
+  }
+
   async function evaluate() {
     if (busy || !settings.enabled || !game) return;
     const snapshot = game.getSnapshot();
     if (!snapshot) { setStatus('等待登入／遊戲狀態'); return; }
     busy = true;
     try {
+      await claimDailyCheckIn(snapshot);
       const fishing = snapshot.fishing;
       if (fishing && ['running', 'completed'].includes(fishing.status) && fishing.remainingCasts < REFILL_BELOW) {
         setStatus(`剩餘 ${fishing.remainingCasts} 杆，補滿中`);
@@ -323,10 +343,6 @@
         const latest = game.getSnapshot() || snapshot;
         await selectSceneBait(currentScene(latest), latest);
         setStatus(moved ? `已前往 ${route.target.name}` : `目前 ${route.target.name}`, route.reason);
-      }
-      if (checkInDue(game.getSnapshot() || snapshot) && await game.dailyCheckIn.claim()) {
-        game.ui.dismissReminder('daily-check-in');
-        setStatus('今日簽到完成');
       }
       renderPanel();
     } catch (error) {
@@ -372,6 +388,7 @@
     document.addEventListener('visibilitychange', () => {
       if (document.visibilityState === 'visible') scheduleEvaluation(0);
     });
+    setInterval(() => { void claimDailyCheckIn(); }, CHECK_IN_INTERVAL_MS);
     await evaluate();
     scheduleEvaluation();
   }
