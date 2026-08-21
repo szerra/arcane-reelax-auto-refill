@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Arcane Reelax 航線助手＋低於 50 杆自動補滿
 // @namespace    https://reelax.cn/
-// @version      2.1.4
-// @description  使用官方瀏覽器腳本 API，自動處理比賽、金風、經驗航線、場景魚餌、簽到及低於 50 杆補滿。
+// @version      2.2.0
+// @description  使用官方瀏覽器腳本 API 與遊戲內航線設定，自動處理航線、魚餌、簽到及低於 50 杆補滿。
 // @author       FishSnack
 // @match        https://reelax.cn/*
 // @match        https://reelax.abang666.com/*
@@ -15,11 +15,12 @@
 (() => {
   'use strict';
 
-  const VERSION = '2.1.4';
+  const VERSION = '2.2.0';
   const REFILL_BELOW = 50;
   const EVALUATE_INTERVAL_MS = 60_000;
   const CHECK_IN_INTERVAL_MS = 1_000;
-  const ROUTE_RETRY_INTERVAL_MS = 5_000;
+  const ROUTE_RETRY_INTERVAL_MS = 30_000;
+  const MAX_TIMER_MS = 2_147_000_000;
   const STORAGE_KEY = 'arcane-reelax-route-helper-v2';
   const LOG_PREFIX = '[Arcane Reelax 航線助手]';
   const PRIORITY_LABELS = { competition: '比賽', golden: '金風', experience: '經驗' };
@@ -32,15 +33,6 @@
   };
   const DEFAULTS = {
     enabled: true,
-    autoTravel: true,
-    autoBait: false,
-    autoCheckIn: false,
-    leaderPartyTravel: true,
-    helmsmanPartyTravel: false,
-    priorities: ['competition', 'golden', 'experience'],
-    baitByScene: {
-      personalCompetition: '', guildCompetition: '', golden: '', arcaneSurge: '', normal: '',
-    },
     collapsed: false,
   };
 
@@ -51,8 +43,12 @@
   let game = null;
   let busy = false;
   let checkInBusy = false;
+  let baitBusy = false;
+  let routeBusy = false;
   let timerId = null;
-  let routeRetryTimerId = null;
+  let routeTimerId = null;
+  let routeDueAt = Number.POSITIVE_INFINITY;
+  let lastRouteResult = null;
   let panel = null;
   let statusNode = null;
   let detailNode = null;
@@ -63,9 +59,8 @@
       const saved = JSON.parse(localStorage.getItem(STORAGE_KEY) || '{}');
       return {
         ...DEFAULTS,
-        ...saved,
-        priorities: Array.isArray(saved.priorities) ? saved.priorities : DEFAULTS.priorities,
-        baitByScene: { ...DEFAULTS.baitByScene, ...(saved.baitByScene || {}) },
+        enabled: typeof saved.enabled === 'boolean' ? saved.enabled : DEFAULTS.enabled,
+        collapsed: typeof saved.collapsed === 'boolean' ? saved.collapsed : DEFAULTS.collapsed,
       };
     } catch {
       return structuredClone(DEFAULTS);
@@ -76,6 +71,7 @@
     localStorage.setItem(STORAGE_KEY, JSON.stringify(settings));
     renderPanel();
     scheduleEvaluation(0);
+    scheduleRouteEvaluation(0);
   }
 
   function setStatus(message, detail = '') {
@@ -111,41 +107,36 @@
     renderPanel();
   }
 
-  function checkbox(label, key) {
-    return `<div class="arrh-row"><label>${label}</label><input type="checkbox" data-setting="${key}" ${settings[key] ? 'checked' : ''}></div>`;
-  }
-
   function renderPanel() {
     if (!panel) return;
     panel.dataset.collapsed = String(settings.collapsed);
     panel.querySelector('#arrh-toggle').textContent = settings.collapsed ? '展開' : '收合';
     const controls = panel.querySelector('#arrh-controls');
-    const baits = game?.getSnapshot()?.baits || [];
-    const baitOptions = (selected) => ['<option value="">不自動切換</option>', ...baits.map((bait) =>
-      `<option value="${escapeHtml(bait.id)}" ${bait.id === selected ? 'selected' : ''}>${escapeHtml(bait.name)}${bait.quantity === null ? '' : ` (${bait.quantity ?? '?'})`}</option>`,
-    )].join('');
+    const snapshot = game?.getSnapshot?.() || null;
+    const shared = game?.routeAssistant?.getSettings?.() || null;
+    const priorities = (shared?.priorities || []).map((key) => PRIORITY_LABELS[key] || key).join(' → ') || '尚未讀取';
+    const baitNames = new Map((snapshot?.baits || []).map((bait) => [bait.id, bait.name]));
+    const baitSummary = shared ? Object.entries(SCENE_LABELS).map(([scene, label]) => {
+      const baitId = shared.baitByScene?.[scene];
+      return `${escapeHtml(label)}：${escapeHtml(baitId ? (baitNames.get(baitId) || baitId) : '關閉')}`;
+    }).join('<br>') : '尚未讀取';
+    const executor = !shared ? '等待遊戲狀態' : shared.isOperational ? '遊戲內付費助手' : '本插件';
+    const routeTarget = snapshot?.biomes?.find((biome) => biome.id === lastRouteResult?.targetBiomeId);
+    const routePlan = routeTarget?.name || lastRouteResult?.targetBiomeId || '尚未申請';
     controls.innerHTML = `
-      ${checkbox('啟用助手', 'enabled')}${checkbox('自動切換地圖', 'autoTravel')}${checkbox('自動選擇魚餌', 'autoBait')}${checkbox('自動每日簽到', 'autoCheckIn')}
-      <hr><b>航線優先順序</b>
-      ${settings.priorities.map((key, index) => `<div class="arrh-priority"><span>${index + 1}. ${PRIORITY_LABELS[key]}</span><button data-up="${key}">↑</button><button data-down="${key}">↓</button></div>`).join('')}
-      <hr><b>船隊</b>${checkbox('船長自動整船切圖', 'leaderPartyTravel')}${checkbox('舵手自動整船切圖', 'helmsmanPartyTravel')}
-      <hr><b>場景魚餌</b>
-      ${Object.entries(SCENE_LABELS).map(([key, label]) => `<div class="arrh-row"><label>${label}</label><select data-scene="${key}">${baitOptions(settings.baitByScene[key])}</select></div>`).join('')}
-      <div class="arrh-note">切換到其他地圖會結束舊批次並放棄尚未完成的剩餘杆數。自動補滿固定在少於 ${REFILL_BELOW} 杆時執行。</div>`;
+      <div class="arrh-row"><label>啟用插件</label><input type="checkbox" data-setting="enabled" ${settings.enabled ? 'checked' : ''}></div>
+      <div class="arrh-row"><label>遊戲航線設定</label><button id="arrh-open-settings">開啟設定</button></div>
+      <hr><b>目前執行者</b><div class="arrh-note">${escapeHtml(executor)}</div>
+      <hr><b>共享設定</b>
+      <div class="arrh-note">自動切圖：${shared?.isAutoTravelEnabled ? '開' : '關'}　自動魚餌：${shared?.isAutoBaitEnabled ? '開' : '關'}　自動簽到：${shared?.isAutoCheckInEnabled ? '開' : '關'}<br>全員解鎖限制：${shared?.isPartyAllMembersUnlockedOnly ? '開' : '關'}<br>優先順序：${escapeHtml(priorities)}<br>服務端航線：${escapeHtml(routePlan)}</div>
+      <hr><b>場景魚餌</b><div class="arrh-note">${baitSummary}</div>
+      <div class="arrh-note">切圖由官方服務端決定並遵守船隊與比賽規則；付費內建助手運作時，插件會暫停切圖、魚餌與簽到。低於 ${REFILL_BELOW} 杆補滿仍由插件執行。</div>`;
     controls.querySelectorAll('[data-setting]').forEach((input) => input.addEventListener('change', () => {
       settings[input.dataset.setting] = input.checked; saveSettings();
     }));
-    controls.querySelectorAll('[data-scene]').forEach((select) => select.addEventListener('change', () => {
-      settings.baitByScene[select.dataset.scene] = select.value; saveSettings();
-    }));
-    controls.querySelectorAll('[data-up],[data-down]').forEach((button) => button.addEventListener('click', () => {
-      const key = button.dataset.up || button.dataset.down;
-      const from = settings.priorities.indexOf(key);
-      const to = from + (button.dataset.up ? -1 : 1);
-      if (to < 0 || to >= settings.priorities.length) return;
-      [settings.priorities[from], settings.priorities[to]] = [settings.priorities[to], settings.priorities[from]];
-      saveSettings();
-    }));
+    controls.querySelector('#arrh-open-settings')?.addEventListener('click', () => {
+      if (!game?.routeAssistant?.openSettings?.()) setStatus('目前遊戲版本無法開啟航線設定', 'UNAVAILABLE');
+    });
   }
 
   function escapeHtml(value) {
@@ -218,7 +209,8 @@
   }
 
   function currentScene(snapshot) {
-    const current = snapshot.biomes.find((biome) => biome.isCurrent);
+    const current = snapshot.biomes.find((biome) => biome.id === snapshot.currentBiomeId) ||
+      snapshot.biomes.find((biome) => biome.isCurrent);
     if (!current) return 'normal';
     const competitions = current.activeCompetitions || [];
     if (competitions.some((competition) => competitionKind(competition) === 'personalCompetition')) return 'personalCompetition';
@@ -229,7 +221,7 @@
 
   function isGolden(biome) {
     const text = `${biome.weather?.id || ''} ${biome.weather?.name || ''} ${biome.weather?.description || ''}`.toLowerCase();
-    return text.includes('金风') || text.includes('金風') || text.includes('golden');
+    return biome.weather?.id === 'gilded_current' || text.includes('金风') || text.includes('金風') || text.includes('golden');
   }
 
   function isArcaneSurge(biome) {
@@ -237,75 +229,98 @@
     return text.includes('奥秘涌流') || text.includes('奧秘湧流') || text.includes('arcane_surge');
   }
 
-  function experienceScore(biome) {
-    const weather = biome.weather?.experienceBonusBasisPoints || 0;
-    const guild = biome.guildBoost?.isActive ? (biome.guildBoost.experienceBonusBasisPoints || 0) : 0;
-    return (1 + weather / 10000) * (1 + guild / 10000);
+  function getSharedSettings() {
+    return game?.routeAssistant?.getSettings?.() || null;
   }
 
-  function highestLevelStable(biomes, currentId) {
-    return [...biomes].sort((a, b) =>
-      Number(b.id === currentId) - Number(a.id === currentId) ||
-      (b.requiredLevel || 0) - (a.requiredLevel || 0) || String(a.id).localeCompare(String(b.id)),
-    )[0] || null;
+  function clearRouteTimer() {
+    if (routeTimerId !== null) clearTimeout(routeTimerId);
+    routeTimerId = null;
+    routeDueAt = Number.POSITIVE_INFINITY;
   }
 
-  function chooseRoute(snapshot) {
-    const unlocked = snapshot.biomes.filter((biome) => biome.isUnlocked);
-    const current = unlocked.find((biome) => biome.isCurrent);
-    for (const priority of settings.priorities) {
-      if (priority === 'competition') {
-        const candidates = unlocked.filter((biome) => (biome.activeCompetitions || []).length > 0);
-        const target = highestLevelStable(candidates, current?.id);
-        if (target) return { target, reason: '比賽', scene: competitionKind(target.activeCompetitions[0]) };
-      }
-      if (priority === 'golden') {
-        const target = highestLevelStable(unlocked.filter(isGolden), current?.id);
-        if (target) return { target, reason: '金風', scene: 'golden' };
-      }
-      if (priority === 'experience' && unlocked.length) {
-        const target = [...unlocked].sort((a, b) =>
-          experienceScore(b) - experienceScore(a) ||
-          Number(b.id === current?.id) - Number(a.id === current?.id) ||
-          (b.requiredLevel || 0) - (a.requiredLevel || 0) || String(a.id).localeCompare(String(b.id)),
-        )[0];
-        return { target, reason: '最高經驗', scene: isArcaneSurge(target) ? 'arcaneSurge' : 'normal' };
-      }
+  function scheduleRouteEvaluation(delay = 0) {
+    const dueAt = Date.now() + Math.max(0, delay);
+    if (routeTimerId !== null && routeDueAt <= dueAt) return;
+    clearRouteTimer();
+    routeDueAt = dueAt;
+    routeTimerId = setTimeout(() => {
+      routeTimerId = null;
+      routeDueAt = Number.POSITIVE_INFINITY;
+      void requestServerRoute();
+    }, Math.min(Math.max(0, delay), MAX_TIMER_MS));
+  }
+
+  function scheduleRouteFromResult(result) {
+    const serverNow = Date.parse(result?.serverTime || '');
+    if (!Number.isFinite(serverNow)) return;
+    const wakeAt = [result.executeAt, result.reevaluateAt]
+      .map((value) => value ? Date.parse(value) : Number.NaN)
+      .filter((value) => Number.isFinite(value) && value > serverNow)
+      .sort((left, right) => left - right)[0];
+    if (wakeAt !== undefined) scheduleRouteEvaluation(wakeAt - serverNow);
+  }
+
+  async function requestServerRoute() {
+    const shared = getSharedSettings();
+    if (!settings.enabled || routeBusy || !game || !shared) return false;
+    if (shared.isOperational || !shared.isAutoTravelEnabled) {
+      clearRouteTimer();
+      renderPanel();
+      return false;
     }
-    return current ? { target: current, reason: '維持目前地圖', scene: isArcaneSurge(current) ? 'arcaneSurge' : 'normal' } : null;
-  }
-
-  async function travel(route, snapshot) {
-    if (!settings.autoTravel || route.target.isCurrent) return false;
-    const party = snapshot.party;
-    const role = String(party?.role || '').toLowerCase();
-    const isCaptain = role === 'captain' || role === 'leader';
-    const useParty = party?.isInParty && party.canChangeBoatBiome &&
-      ((isCaptain && settings.leaderPartyTravel) || (role === 'helmsman' && settings.helmsmanPartyTravel));
-    if (party?.isInParty && !useParty) return false;
-    setStatus(`前往 ${route.target.name}`, route.reason);
+    routeBusy = true;
+    setStatus('向服務端申請航線');
     try {
-      if (useParty) await game.party.travelTo(route.target.id);
-      else await game.biomes.travelTo(route.target.id);
-      clearRouteRetry();
-      return true;
+      const result = await game.routeAssistant.travel();
+      lastRouteResult = result;
+      scheduleRouteFromResult(result);
+      const latest = game.getSnapshot();
+      const target = latest?.biomes?.find((biome) => biome.id === result.targetBiomeId);
+      const targetName = target?.name || result.targetBiomeId || '目標地圖';
+      const reason = PRIORITY_LABELS[result.reason] || '航線';
+      if (result.status === 'traveled') setStatus(`已前往 ${targetName}`, reason);
+      else if (result.status === 'deferred') setStatus(`已排定前往 ${targetName}`, reason);
+      else if (result.status === 'unchanged') setStatus(`目前 ${targetName}`, reason);
+      else setStatus('服務端目前沒有航線目標');
+      if (result.reason === 'competition' && result.status !== 'deferred') game.ui?.dismissReminder?.('competition');
+      if (latest) await selectSceneBait(currentScene(latest), latest);
+      renderPanel();
+      return result.status === 'traveled';
     } catch (error) {
-      scheduleRouteRetry();
-      throw error;
+      setStatus(error?.message || '自動切圖失敗', error?.code || 'ERROR');
+      scheduleRouteEvaluation(ROUTE_RETRY_INTERVAL_MS);
+      console.warn(LOG_PREFIX, error);
+      return false;
+    } finally {
+      routeBusy = false;
     }
   }
 
   async function selectSceneBait(scene, snapshot) {
-    if (!settings.autoBait) return false;
-    const baitId = settings.baitByScene[scene];
+    const shared = getSharedSettings();
+    if (baitBusy || !settings.enabled || !shared || shared.isOperational || !shared.isAutoBaitEnabled) return false;
+    const baitId = shared.baitByScene?.[scene];
     if (!baitId) return false;
     const bait = snapshot.baits.find((item) => item.id === baitId);
     if (!bait || bait.isSelected || (bait.quantity !== null && bait.quantity <= 0)) return false;
-    return game.fishing.selectBait(baitId);
+    baitBusy = true;
+    try {
+      const didSelect = await game.fishing.selectBait(baitId);
+      if (didSelect) setStatus(`已切換 ${bait.name}`, SCENE_LABELS[scene] || '魚餌');
+      return didSelect;
+    } catch (error) {
+      setStatus(error?.message || '自動切換魚餌失敗', error?.code || 'ERROR');
+      console.warn(LOG_PREFIX, error);
+      return false;
+    } finally {
+      baitBusy = false;
+    }
   }
 
   function checkInDue(snapshot) {
-    return Boolean(settings.autoCheckIn && snapshot.dailyCheckIn?.canClaim);
+    const shared = getSharedSettings();
+    return Boolean(shared && !shared.isOperational && shared.isAutoCheckInEnabled && snapshot.dailyCheckIn?.canClaim);
   }
 
   async function claimDailyCheckIn(snapshot = game?.getSnapshot()) {
@@ -336,14 +351,10 @@
       if (fishing && ['running', 'completed'].includes(fishing.status) && fishing.remainingCasts < REFILL_BELOW) {
         setStatus(`剩餘 ${fishing.remainingCasts} 杆，補滿中`);
         if (await game.fishing.refill()) setStatus(`已補滿至 ${fishing.totalCasts} 杆`);
+        else setStatus(`剩餘 ${fishing.remainingCasts} 杆`, '尚未達官方補滿門檻');
       }
-      const route = chooseRoute(snapshot);
-      if (route) {
-        const moved = await travel(route, snapshot);
-        const latest = game.getSnapshot() || snapshot;
-        await selectSceneBait(currentScene(latest), latest);
-        setStatus(moved ? `已前往 ${route.target.name}` : `目前 ${route.target.name}`, route.reason);
-      }
+      const latest = game.getSnapshot() || snapshot;
+      await selectSceneBait(currentScene(latest), latest);
       renderPanel();
     } catch (error) {
       setStatus(error?.message || '操作失敗', error?.code || 'ERROR');
@@ -358,20 +369,6 @@
     timerId = setTimeout(async () => { timerId = null; await evaluate(); scheduleEvaluation(); }, delay);
   }
 
-  function clearRouteRetry() {
-    if (routeRetryTimerId === null) return;
-    clearTimeout(routeRetryTimerId);
-    routeRetryTimerId = null;
-  }
-
-  function scheduleRouteRetry() {
-    if (routeRetryTimerId !== null) return;
-    routeRetryTimerId = setTimeout(() => {
-      routeRetryTimerId = null;
-      scheduleEvaluation(0);
-    }, ROUTE_RETRY_INTERVAL_MS);
-  }
-
   async function start() {
     createPanel();
     const levelObserver = new MutationObserver(renderLevelExperience);
@@ -381,15 +378,30 @@
     setInterval(syncLevelExperienceFromPage, 1_000);
     setStatus('等待官方 API');
     game = await getGameApi();
+    if (game.apiVersion !== 2 || !game.routeAssistant?.travel || !game.routeAssistant?.getSettings) {
+      throw new Error(`不支援的官方 API 版本：${game.apiVersion ?? '未知'}`);
+    }
     renderPanel();
     for (const event of ['weather:changed', 'guild-boost:started', 'guild-boost:ended', 'competition:started']) {
-      game.on(event, () => scheduleEvaluation(0));
+      game.on(event, () => {
+        scheduleEvaluation(0);
+        scheduleRouteEvaluation(0);
+      });
     }
+    game.on('route-assistant:settings-changed', () => {
+      renderPanel();
+      scheduleEvaluation(0);
+      scheduleRouteEvaluation(0);
+    });
     document.addEventListener('visibilitychange', () => {
-      if (document.visibilityState === 'visible') scheduleEvaluation(0);
+      if (document.visibilityState === 'visible') {
+        scheduleEvaluation(0);
+        scheduleRouteEvaluation(0);
+      }
     });
     setInterval(() => { void claimDailyCheckIn(); }, CHECK_IN_INTERVAL_MS);
     await evaluate();
+    scheduleRouteEvaluation(0);
     scheduleEvaluation();
   }
 
